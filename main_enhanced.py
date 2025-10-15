@@ -263,9 +263,8 @@ def build_enhanced_prompt_for_node(node_id, source_data, experts_outputs, cls_mo
         source_data.edge_index, mask=node_mask, num_nodes=source_data.num_nodes, style='natural'
     )
 
-    # Enhanced prompt
-    prompt = f"""
-    You are an expert GNN analyst. For node {node_id} with the following neighborhood structure:
+    # Enhanced prompt following LLM_Guided_MoE_Reproduction_Prompt.md
+    prompt = f"""You are an expert GNN analyst. For node {node_id} with the following neighborhood structure:
     {graph_description}
 
     Current expert predictions:
@@ -280,13 +279,17 @@ def build_enhanced_prompt_for_node(node_id, source_data, experts_outputs, cls_mo
     2. Prediction confidence patterns
     3. Expert specialization characteristics
 
+    Based on the reproduction guide, rank all experts from most to least suitable for this node.
+
     Return your analysis in JSON format:
     {{
         "reasoning": "detailed analysis of structure and predictions",
-        "expert": {min(expert_num-1, 3)},
+        "expert": 0,
         "confidence": 0.85,
-        "ranking": [0, 1, 2, {min(expert_num-1, 3)}]
+        "ranking": [0, 1, 2, 3, 4, 5]
     }}
+
+    CRITICAL: You MUST include the "ranking" field with ALL {expert_num} experts ranked from best (0) to worst ({expert_num-1}).
     """
     return prompt
 
@@ -451,6 +454,14 @@ def train_epoch(epoch, encoder_name, encoder, optimizer):
 
                     # Debug: Print the parsed response to see what we got
                     print(f"[DEBUG] Node {node_id} parsed response: {parsed_response}")
+
+                    # Generate ranking if missing but have expert selection
+                    if 'ranking' not in parsed_response and 'expert' in parsed_response:
+                        preferred_expert = parsed_response['expert']
+                        # Create ranking: preferred expert first, then others
+                        ranking = [preferred_expert] + [i for i in range(config.expert_num) if i != preferred_expert]
+                        parsed_response['ranking'] = ranking
+                        print(f"[DEBUG] Node {node_id} generated ranking from expert: {ranking}")
 
                     # Extract DPO preferences
                     if 'ranking' in parsed_response:

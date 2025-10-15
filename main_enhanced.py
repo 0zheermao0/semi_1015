@@ -296,7 +296,17 @@ print("Initializing models...")
 # Create encoder(s) based on architecture
 encoders = {}
 if config.moe_architecture in ['original', 'both']:
-    num_hops_config = [1, 2, 3][:config.expert_num] if config.expert_num >= 3 else [1] * config.expert_num
+    # Create num_hops configuration that matches expert_num
+    if config.expert_num <= 3:
+        num_hops_config = [1] * config.expert_num
+    else:
+        # For more than 3 experts, create a pattern: [1, 2, 3, 1, 2, 3, ...]
+        base_hops = [1, 2, 3]
+        num_hops_config = []
+        for i in range(config.expert_num):
+            num_hops_config.append(base_hops[i % len(base_hops)])
+
+    print(f"Created num_hops_config: {num_hops_config} for {config.expert_num} experts")
     encoders['original'] = MoE(
         input_size=source_data.num_features,
         output_size=config.encoder_dim,

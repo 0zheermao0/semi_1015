@@ -15,7 +15,7 @@ class EnhancedLLMCacheManager:
     configuration hashing, and compatibility features.
     """
 
-    def __init__(self, cache_dir: str = "llm_cache", max_cache_size: int = 10000):
+    def __init__(self, cache_dir: str = "llm_cache", max_cache_size: int = 10000, **kwargs):
         """
         Initialize the LLM cache manager.
 
@@ -23,6 +23,10 @@ class EnhancedLLMCacheManager:
             cache_dir: Directory to store cache files
             max_cache_size: Maximum number of cached responses
         """
+        # Handle both parameter names for backward compatibility
+        if 'llm_cache_dir' in kwargs:
+            cache_dir = kwargs['llm_cache_dir']
+
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True)
         self.max_cache_size = max_cache_size

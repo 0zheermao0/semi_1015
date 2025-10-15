@@ -465,9 +465,14 @@ def train_epoch(epoch, encoder_name, encoder, optimizer):
 
                     # Extract DPO preferences
                     if 'ranking' in parsed_response:
-                        dpo_prefs = response_parser.parse_dpo_preferences(json_output_str, config.expert_num)
+                        # Create DPO preferences from the parsed ranking directly
+                        ranking = parsed_response['ranking']
+                        dpo_prefs = []
+                        for i in range(len(ranking) - 1):
+                            for j in range(i + 1, len(ranking)):
+                                dpo_prefs.append((ranking[i], ranking[j]))
                         dpo_preferences.extend(dpo_prefs)
-                        print(f"[DEBUG] Node {node_id} extracted {len(dpo_prefs)} DPO preferences")
+                        print(f"[DEBUG] Node {node_id} extracted {len(dpo_prefs)} DPO preferences from ranking: {ranking}")
                     else:
                         print(f"[DEBUG] Node {node_id} no 'ranking' field in parsed response: {list(parsed_response.keys())}")
 

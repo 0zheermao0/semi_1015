@@ -3,6 +3,7 @@ import json
 import pickle
 import hashlib
 import time
+import re
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
 import torch
@@ -336,7 +337,6 @@ class LLMResponseParser:
 
         # Strategy 2: Extract expert number with regex
         try:
-            import re
             # Look for patterns like "expert": 2 or expert:2 or Expert 2
             expert_patterns = [
                 r'"expert":\s*(\d+)',

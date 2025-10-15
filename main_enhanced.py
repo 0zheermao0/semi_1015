@@ -509,10 +509,12 @@ def train_epoch(epoch, encoder_name, encoder, optimizer):
     # Classification loss
     cls_loss = F.cross_entropy(source_logits[label_mask], source_data.y[label_mask])
 
-    # Diversity loss (for GAT+Soft-prompt MoE)
+    # Diversity loss (for both Original and GAT+Soft-prompt MoE)
     diversity_loss = torch.tensor(0.0, device=device)
-    if encoder_name == 'gat_soft_prompt' and hasattr(encoder, 'diversity_loss'):
+    # Calculate diversity loss for all MoE architectures when we have expert outputs
+    if experts_outputs is not None and clean_logits is not None:
         diversity_loss = loss_functions['mmd_diversity'](experts_outputs, clean_logits)
+        print(f"[DEBUG] Diversity loss calculated: {diversity_loss.item()}")
 
     # Gate entropy regularization
     gate_entropy_loss = loss_functions['gate_entropy'](clean_logits)

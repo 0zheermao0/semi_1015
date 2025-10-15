@@ -94,82 +94,85 @@ class DPOLoss(nn.Module):
 
 class EnhancedConsistencyLoss(nn.Module):
     """
-    Enhanced consistency loss using KL divergence between expert predictions.
-    Encourages consistency between experts that are ranked similarly by LLM.
+    DyCon-inspired uncertainty-aware consistency loss.
+
+    This implements the core idea from DyCon: uncertainty-weighted consistency
+    between student and teacher predictions, where the weighting is based on
+    prediction entropy (uncertainty). Lower uncertainty predictions receive
+    higher weights.
+
+    The loss follows DyCon's UnCLoss implementation:
+    1. Compute entropy of student and teacher predictions
+    2. Apply exponential weighting based on entropy and beta parameter
+    3. Weight the squared difference between predictions by uncertainty
+    4. Add entropy regularization to encourage confident predictions
     """
 
-    def __init__(self, beta: float = 0.1, temperature: float = 1.0):
+    def __init__(self, beta: float = 0.8):
         """
-        Initialize enhanced consistency loss.
+        Initialize DyCon-inspired consistency loss.
 
         Args:
-            beta: Weight for consistency loss
-            temperature: Temperature for softmax computation
+            beta: Entropy weighting parameter (similar to DyCon's beta)
         """
         super(EnhancedConsistencyLoss, self).__init__()
         self.beta = beta
-        self.temperature = temperature
-        self.kl_div = nn.KLDivLoss(reduction='batchmean', log_target=True)
 
-    def forward(self, expert_outputs: torch.Tensor, rankings: Dict[int, List[int]],
-                node_indices: torch.Tensor) -> torch.Tensor:
+    def forward(self, student_logits: torch.Tensor, teacher_logits: torch.Tensor,
+                rankings: Dict[int, List[int]] = None, node_indices: torch.Tensor = None) -> torch.Tensor:
         """
-        Compute enhanced consistency loss based on LLM rankings.
+        Compute uncertainty-aware consistency loss following DyCon's approach.
 
         Args:
-            expert_outputs: Expert outputs [num_nodes, num_experts, feature_dim]
-            rankings: Dictionary mapping node_id to expert rankings
-            node_indices: Indices of nodes with rankings
+            student_logits: Student model logits [num_nodes, num_classes]
+            teacher_logits: Teacher model logits [num_nodes, num_classes]
+            rankings: Optional LLM rankings (not used in DyCon's core consistency)
+            node_indices: Optional node indices (not used in DyCon's core consistency)
 
         Returns:
-            Enhanced consistency loss
+            Uncertainty-aware consistency loss
         """
-        if len(rankings) == 0:
-            return torch.tensor(0.0, device=expert_outputs.device, requires_grad=True)
+        EPS = 1e-6
 
-        total_loss = torch.tensor(0.0, device=expert_outputs.device)
-        num_nodes_considered = 0
+        # Compute student softmax probabilities and their entropy
+        p_s = F.softmax(student_logits, dim=1)  # (num_nodes, num_classes)
+        p_s_log = torch.log(p_s + EPS)
+        H_s = -torch.sum(p_s * p_s_log, dim=1, keepdim=True)  # (num_nodes, 1)
 
-        for i, node_idx in enumerate(node_indices):
-            if node_idx.item() not in rankings:
-                continue
+        # Compute teacher softmax probabilities and their entropy
+        p_t = F.softmax(teacher_logits, dim=1)  # (num_nodes, num_classes)
+        p_t_log = torch.log(p_t + EPS)
+        H_t = -torch.sum(p_t * p_t_log, dim=1, keepdim=True)  # (num_nodes, 1)
 
-            node_rankings = rankings[node_idx.item()]
-            if len(node_rankings) < 2:
-                continue
+        # Exponentiate the entropies scaled by beta (DyCon's approach)
+        exp_H_s = torch.exp(self.beta * H_s)
+        exp_H_t = torch.exp(self.beta * H_t)
 
-            # Get expert outputs for this node
-            node_expert_outputs = expert_outputs[node_idx]  # [num_experts, feature_dim]
+        # Compute the entropy-weighted squared difference between student and teacher distributions
+        # Higher certainty (lower entropy) receives larger weight on the difference
+        loss = (p_s - p_t)**2 / (exp_H_s + exp_H_t)
 
-            # Create consistency pairs based on rankings
-            consistency_pairs = []
-            for j in range(len(node_rankings) - 1):
-                for k in range(j + 1, len(node_rankings)):
-                    expert_i = node_rankings[j]
-                    expert_k = node_rankings[k]
-                    if expert_i < expert_outputs.shape[1] and expert_k < expert_outputs.shape[1]:
-                        consistency_pairs.append((expert_i, expert_k))
+        # Sum the differences over the class dimension, add entropy regularization, and average
+        # This follows DyCon's UnCLoss exactly
+        loss = torch.mean(loss.sum(dim=1) + self.beta * (H_s + H_t))
 
-            # Compute consistency loss for each pair
-            for expert_i, expert_k in consistency_pairs:
-                output_i = node_expert_outputs[expert_i].unsqueeze(0)  # [1, feature_dim]
-                output_k = node_expert_outputs[expert_k].unsqueeze(0)  # [1, feature_dim]
+        return loss.mean()
 
-                # Convert to probability distributions using softmax
-                prob_i = F.softmax(output_i / self.temperature, dim=-1)
-                prob_k = F.softmax(output_k / self.temperature, dim=-1)
+    def compute_uncertainty_weights(self, logits: torch.Tensor) -> torch.Tensor:
+        """
+        Compute uncertainty weights for predictions (for analysis/debugging).
 
-                # Compute KL divergence (symmetric)
-                kl_loss = self.kl_div(F.log_softmax(output_i / self.temperature, dim=-1), prob_k)
-                kl_loss += self.kl_div(F.log_softmax(output_k / self.temperature, dim=-1), prob_i)
+        Args:
+            logits: Model predictions [num_nodes, num_classes]
 
-                total_loss += kl_loss * 0.5  # Average of symmetric KL
-                num_nodes_considered += 1
-
-        if num_nodes_considered == 0:
-            return torch.tensor(0.0, device=expert_outputs.device, requires_grad=True)
-
-        return self.beta * total_loss / num_nodes_considered
+        Returns:
+            Uncertainty weights [num_nodes, 1]
+        """
+        p = F.softmax(logits, dim=1)
+        p_log = torch.log(p + 1e-6)
+        H = -torch.sum(p * p_log, dim=1, keepdim=True)
+        weights = 1.0 / (torch.exp(self.beta * H) + 1e-6)
+        return weights
 
 
 class MMDDiversityLoss(nn.Module):

@@ -71,13 +71,17 @@ parser.add_argument("--moe_architecture", type=str, default='original', choices=
 parser.add_argument("--prompt_length", type=int, default=8, help="Length of soft prompts for GAT+Soft-prompt MoE")
 parser.add_argument("--num_heads", type=int, default=4, help="Number of attention heads for GAT experts")
 
-# Loss parameters
-parser.add_argument("--alpha", type=float, default=0.61, help="DPO temperature parameter")
-parser.add_argument("--beta", type=float, default=0.11, help="Consistency loss weight")
-parser.add_argument("--consistency_weight", type=float, default=1.0, help="Consistency loss weight")
-parser.add_argument("--div_weight", type=float, default=0.01, help="Diversity loss weight")
+# DyCon-inspired loss parameters (following DyCon's hyperparameter settings)
+parser.add_argument("--alpha", type=float, default=2.0, help="DPO temperature parameter (DyCon-style)")
+parser.add_argument("--beta", type=float, default=0.8, help="Uncertainty weighting for consistency loss (DyCon's beta)")
+parser.add_argument("--beta_min", type=float, default=0.5, help="Minimum adaptive beta (DyCon)")
+parser.add_argument("--beta_max", type=float, default=5.0, help="Maximum adaptive beta (DyCon)")
+parser.add_argument("--consistency_weight", type=float, default=0.1, help="Consistency loss weight (DyCon)")
+parser.add_argument("--div_weight", type=float, default=0.5, help="Diversity loss weight")
 parser.add_argument("--select_weight", type=float, default=1.0, help="Selection loss weight")
 parser.add_argument("--gate_coef", type=float, default=0.1, help="Gate loss coefficient")
+parser.add_argument("--ema_decay", type=float, default=0.99, help="EMA decay for teacher model (DyCon)")
+parser.add_argument("--consistency_rampup", type=float, default=200.0, help="Consistency ramp-up epochs (DyCon)")
 
 # Training parameters
 parser.add_argument("--epochs", type=int, default=200)
@@ -293,6 +297,14 @@ def build_enhanced_prompt_for_node(node_id, source_data, experts_outputs, cls_mo
     """
     return prompt
 
+# DyCon-inspired adaptive beta function
+def adaptive_beta(epoch, total_epochs, max_beta=5.0, min_beta=0.5):
+    """Adaptive beta computation following DyCon's approach."""
+    ratio = min_beta / max_beta
+    exponent = epoch / total_epochs
+    beta = max_beta * (ratio ** exponent)
+    return beta
+
 # Initialize models based on architecture
 print("Initializing models...")
 
@@ -398,21 +410,52 @@ else:
 source_data.new_adj = index2dense(source_edge_index, source_data.num_nodes).to(device)
 target_data.new_adj = index2dense(target_edge_index, target_data.num_nodes).to(device)
 
+# DyCon-inspired Teacher-EMA setup
+def update_ema_variables(student_model, ema_model, alpha, global_step):
+    """Update EMA teacher model following DyCon's approach."""
+    # Use the true average until the exponential average is more correct
+    alpha = min(1 - 1 / (global_step + 1), alpha)
+    for ema_param, student_param in zip(ema_model.parameters(), student_model.parameters()):
+        ema_param.data.mul_(alpha).add_(1 - alpha, student_param.data)
+
+# Create teacher models (EMA copies of student models)
+teacher_encoders = {}
+for encoder_name, encoder in encoders.items():
+    teacher_encoder = type(encoder)(**{k: v for k, v in encoder.__dict__.items() if not k.startswith('_')})
+    teacher_encoder.load_state_dict(encoder.state_dict())
+    # Freeze teacher parameters initially
+    for param in teacher_encoder.parameters():
+        param.detach_()
+    teacher_encoders[encoder_name] = teacher_encoder.to(device)
+
 # Training setup
 expert_selections_cache = {}
+global_step = 0
 
-def train_epoch(epoch, encoder_name, encoder, optimizer):
-    """Enhanced training epoch."""
-    encoder.train()
+def train_epoch(epoch, encoder_name, student_encoder, teacher_encoder, optimizer):
+    """DyCon-inspired training epoch with student-teacher architecture."""
+    global global_step
+    student_encoder.train()
+    teacher_encoder.eval()
     cls_model.train()
 
-    # Forward pass
+    # Forward pass for student
     cache_name = f"{config.source}_{encoder_name}"
-    encoded_source, experts_outputs, aux_loss, clean_logits = encode(source_data, cache_name, encoder)
-    source_logits = cls_model(encoded_source)
+    student_encoded, student_experts_outputs, student_aux_loss, student_clean_logits = encode(source_data, cache_name, student_encoder)
+    student_logits = cls_model(student_encoded)
 
-    # Calculate uncertainty
-    uncertainty_mask = calculate_expert_uncertainty(experts_outputs, source_data.num_classes, cls_model, config.uncertainty_k)
+    # Forward pass for teacher with noise (DyCon approach)
+    with torch.no_grad():
+        # Add noise to teacher input for consistency regularization
+        noise = torch.clamp(torch.randn_like(source_data.x) * 0.1, -0.2, 0.2)
+        noisy_source_data = source_data.clone()
+        noisy_source_data.x = source_data.x + noise
+
+        teacher_encoded, teacher_experts_outputs, teacher_aux_loss, teacher_clean_logits = encode(noisy_source_data, cache_name, teacher_encoder)
+        teacher_logits = cls_model(teacher_encoded)
+
+    # Calculate uncertainty using student expert outputs
+    uncertainty_mask = calculate_expert_uncertainty(student_experts_outputs, source_data.num_classes, cls_model, config.uncertainty_k)
     uncertainty_node_indices = torch.where(uncertainty_mask)[0].tolist()
 
     # Debug output
@@ -420,11 +463,15 @@ def train_epoch(epoch, encoder_name, encoder, optimizer):
     print(f"[DEBUG] LLM interval check: epoch % {config.llm_interval} == {epoch % config.llm_interval}")
     print(f"[DEBUG] Should call LLM: {len(uncertainty_node_indices) > 0 and (epoch % config.llm_interval == 0)}")
 
-    # LLM-guided expert selection
+    # DyCon-inspired consistency loss (student-teacher uncertainty-weighted)
+    # Use adaptive beta following DyCon's approach
+    current_beta = adaptive_beta(epoch, config.epochs, config.beta_max, config.beta_min)
+    loss_functions['consistency'].beta = current_beta  # Update beta for current epoch
+    consistency_loss = loss_functions['consistency'](student_logits, teacher_logits)
+
+    # LLM-guided expert selection (DPO ranking for challenging samples)
     dpo_loss = torch.tensor(0.0, device=device)
-    consistency_loss = torch.tensor(0.0, device=device)
     dpo_preferences = []
-    consistency_rankings = {}
 
     if uncertainty_node_indices and (epoch % config.llm_interval == 0):
         print(f"Epoch {epoch}: Calling LLM for {len(uncertainty_node_indices)} uncertain nodes...")
@@ -435,7 +482,7 @@ def train_epoch(epoch, encoder_name, encoder, optimizer):
             if cache_key not in expert_selections_cache:
                 try:
                     prompt = build_enhanced_prompt_for_node(
-                        node_id, source_data, experts_outputs, cls_model, config.expert_num,
+                        node_id, source_data, student_experts_outputs, cls_model, config.expert_num,
                         config.hop, config.node_limit
                     )
 
@@ -463,7 +510,7 @@ def train_epoch(epoch, encoder_name, encoder, optimizer):
                         parsed_response['ranking'] = ranking
                         print(f"[DEBUG] Node {node_id} generated ranking from expert: {ranking}")
 
-                    # Extract DPO preferences
+                    # Extract DPO preferences (challenging sample ranking)
                     if 'ranking' in parsed_response:
                         # Create DPO preferences from the parsed ranking directly
                         ranking = parsed_response['ranking']
@@ -476,67 +523,55 @@ def train_epoch(epoch, encoder_name, encoder, optimizer):
                     else:
                         print(f"[DEBUG] Node {node_id} no 'ranking' field in parsed response: {list(parsed_response.keys())}")
 
-                    # Extract consistency rankings
-                    if 'ranking' in parsed_response:
-                        consistency_rankings[node_id] = parsed_response['ranking']
-                        print(f"[DEBUG] Node {node_id} consistency ranking: {parsed_response['ranking']}")
-                    else:
-                        print(f"[DEBUG] Node {node_id} no 'ranking' for consistency")
-
                 except Exception as e:
                     print(f"Node {node_id}: Error processing LLM response: {e}")
                     expert_selections_cache[cache_key] = {"expert": 0, "confidence": 0.5, "strategy": "error_fallback"}
-                    consistency_rankings[node_id] = list(range(config.expert_num))
 
-        # Calculate DPO loss
+        # Calculate DPO loss for challenging samples
         print(f"[DEBUG] DPO preferences collected: {len(dpo_preferences)}")
         if dpo_preferences:
             uncertainty_tensor = torch.tensor(uncertainty_node_indices, dtype=torch.long)
-            dpo_loss = loss_functions['dpo'](clean_logits, dpo_preferences, uncertainty_tensor)
+            dpo_loss = loss_functions['dpo'](student_clean_logits, dpo_preferences, uncertainty_tensor)
             print(f"[DEBUG] DPO loss calculated: {dpo_loss.item()}")
         else:
             print(f"[DEBUG] No DPO preferences, DPO loss remains 0")
 
-        # Calculate consistency loss
-        print(f"[DEBUG] Consistency rankings collected: {len(consistency_rankings)}")
-        if consistency_rankings:
-            uncertainty_tensor = torch.tensor(list(consistency_rankings.keys()), dtype=torch.long)
-            consistency_loss = loss_functions['consistency'](experts_outputs, consistency_rankings, uncertainty_tensor)
-            print(f"[DEBUG] Consistency loss calculated: {consistency_loss.item()}")
-        else:
-            print(f"[DEBUG] No consistency rankings, consistency loss remains 0")
-
     # Classification loss
-    cls_loss = F.cross_entropy(source_logits[label_mask], source_data.y[label_mask])
+    cls_loss = F.cross_entropy(student_logits[label_mask], source_data.y[label_mask])
 
     # Diversity loss (for both Original and GAT+Soft-prompt MoE)
     diversity_loss = torch.tensor(0.0, device=device)
     # Calculate diversity loss for all MoE architectures when we have expert outputs
-    if experts_outputs is not None and clean_logits is not None:
-        diversity_loss = loss_functions['mmd_diversity'](experts_outputs, clean_logits)
+    if student_experts_outputs is not None and student_clean_logits is not None:
+        diversity_loss = loss_functions['mmd_diversity'](student_experts_outputs, student_clean_logits)
         print(f"[DEBUG] Diversity loss calculated: {diversity_loss.item()}")
 
     # Gate entropy regularization
-    gate_entropy_loss = loss_functions['gate_entropy'](clean_logits)
+    gate_entropy_loss = loss_functions['gate_entropy'](student_clean_logits)
 
-    # Get loss weights from scheduler
+    # Get loss weights from scheduler (DyCon-style consistency ramp-up)
     weights = scheduler.get_loss_weights(epoch)
+    consistency_weight = weights['consistency_weight'] * min(1.0, (epoch / 100.0))  # Gradual ramp-up
 
-    # Total loss
+    # Total loss (following DyCon's formulation)
     total_loss = (
         weights['cls_weight'] * cls_loss +
         weights['select_weight'] * dpo_loss +
-        weights['consistency_weight'] * consistency_loss +
+        consistency_weight * consistency_loss +  # DyCon-style weighted consistency
         weights['diversity_weight'] * diversity_loss +
         weights['gate_weight'] * gate_entropy_loss +
-        aux_loss
+        student_aux_loss + teacher_aux_loss
     )
 
     # Backward pass
     optimizer.zero_grad()
     total_loss.backward()
-    torch.nn.utils.clip_grad_norm_(list(encoder.parameters()) + list(cls_model.parameters()), 1.0)
+    torch.nn.utils.clip_grad_norm_(list(student_encoder.parameters()) + list(cls_model.parameters()), 1.0)
     optimizer.step()
+
+    # Update EMA teacher model (DyCon approach)
+    update_ema_variables(student_encoder, teacher_encoder, alpha=config.ema_decay, global_step=global_step)
+    global_step += 1
 
     # Log losses and performance metrics
     loss_dict = {
@@ -606,8 +641,9 @@ for epoch in range(1, config.epochs + 1):
     epoch_results = {}
 
     # Train each encoder
-    for encoder_name, encoder in encoders.items():
-        loss, loss_dict = train_epoch(epoch, encoder_name, encoder, optimizers[encoder_name])
+    for encoder_name, student_encoder in encoders.items():
+        teacher_encoder = teacher_encoders[encoder_name]
+        loss, loss_dict = train_epoch(epoch, encoder_name, student_encoder, teacher_encoder, optimizers[encoder_name])
         epoch_results[encoder_name] = loss_dict
         training_history[encoder_name].append(loss_dict)
 

@@ -1,0 +1,92 @@
+# Python script to execute
+program: main_bak1.py
+
+# Method for hyperparameter search: grid, random, or bayes
+method: grid
+
+# Metric to optimize
+metric:
+  name: eval/best_target_acc  # Name of the metric reported to W&B
+  goal: maximize             # Or minimize
+
+# Parameters to search over
+parameters:
+  # Learning rate:
+  # For this grid search focusing on weights and datasets, learning_rate is set to a fixed value.
+  # If you want to include learning_rate in the grid search, change 'value' to 'values'
+  # and provide a list, e.g., values: [0.001, 0.002, 0.005].
+  learning_rate:
+    value: 0.001 # Example: using the lower bound from the original config's min value
+  source:
+    value: "acmv9"
+  target:
+    value: "dblpv7"
+  wandb_project:
+    value: "A -> D"
+
+
+  # select_weight parameter for grid search
+  select_weight:
+    values: [0.2, 0.4, 0.6, 0.8, 1.0]
+
+  # semi_weight parameter for grid search
+  # This parameter was previously commented out or not present.
+  semi_weight:
+    values: [0.2, 0.4, 0.6, 0.8, 1.0]
+
+  div_weight:
+    values: [0.2, 0.4, 0.6, 0.8, 1.0]
+
+  # alpha:
+  #   values: [0.2, 0.4, 0.6, 0.8, 1.0]
+
+  # expert_num:
+  #   values: [3, 4, 5, 6, 7]
+  # 
+  # label_rate:
+  #   values: [0.01, 0.03, 0.05, 0.07, 0.09, 0.1]
+
+  # Parameters for different source/target datasets.
+  # IMPORTANT: Replace 'source_dataset_cli_arg' and 'target_dataset_cli_arg'
+  # with the actual command-line argument names your script 'main_bak1.py' expects
+  # (e.g., if your script uses '--source S_NAME --target T_NAME', the keys here would be 'source' and 'target').
+  # Also, replace the example dataset names with your actual dataset identifiers.
+  # source_dataset_cli_arg: # Example: if your script takes --source_dataset_cli_arg NAME
+  #   values: ["src_data_A", "src_data_B"] # Replace with your actual source dataset names/IDs
+
+  # target_dataset_cli_arg: # Example: if your script takes --target_dataset_cli_arg NAME
+  #   values: ["tgt_data_X", "tgt_data_Y"] # Replace with your actual target dataset names/IDs
+
+  # ---------------------------------------------------------------------------
+  # Other parameters from the original configuration (kept commented out)
+  # If you want to include any of these in the grid search, uncomment them
+  # and ensure they use the 'values: [...]' syntax for grid search.
+  # Distributions (like log_uniform_values, uniform) are for 'bayes' or 'random' search.
+  # ---------------------------------------------------------------------------
+
+  # weight_decay:
+  #   distribution: log_uniform_values # For grid, would be e.g., values: [1e-4, 5e-4, 1e-3]
+  #   min: 1e-4
+  #   max: 1e-2
+
+  # drop_out: # Even if unused in model, keep if defined in args/config
+  #   distribution: uniform # For grid, would be e.g., values: [0.1, 0.3, 0.5]
+  #   min: 0.1
+  #   max: 0.5
+
+  # encoder_dim:
+  #   values: [256, 512] # This is already in grid format
+
+  # uncertainty_k:
+  #   distribution: int_uniform # For grid, would be e.g., values: [100, 300, 500]
+  #   min: 100
+  #   max: 500
+
+  # gate_coef:
+  #   distribution: log_uniform_values # For grid, would be e.g., values: [1e-3, 1e-2, 5e-2]
+  #   min: 1e-3
+  #   max: 5e-2
+
+  # llm:
+  #   values: ["qwen2.5:3b", "qwen2.5:7b"] # This is already in grid format
+

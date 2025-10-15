@@ -1,0 +1,47 @@
+# Example configuration file for MoEDG with OpenAI-compatible API
+
+# Dataset configuration
+source: dblpv7
+target: citationv1
+seed: 1
+label_rate: 0.05
+
+# Model hyperparameters
+learning_rate: 1e-3
+weight_decay: 2e-3
+drop_out: 0.1
+encoder_dim: 512
+expert_num: 6
+uncertainty_k: 100
+gate_coef: 0.1
+select_weight: 1.0
+semi_weight: 1.0
+div_weight: 5e-5
+
+# LLM configuration (OpenAI-compatible)
+llm: gpt-3.5-turbo  # Can be any OpenAI-compatible model
+temperature: 0.0
+max_tokens: 4096
+timeout: 60
+
+# OpenAI API settings
+# Option 1: Set via environment variables (recommended)
+# OPENAI_API_KEY=your_api_key_here
+# OPENAI_BASE_URL=https://api.openai.com/v1  # or your custom endpoint
+
+# Option 2: Set in config (less secure)
+# openai_api_key: sk-your-api-key-here
+# openai_base_url: https://api.openai.com/v1  # or your custom endpoint like http://localhost:8000/v1
+
+# Example for using local LLM with OpenAI-compatible API:
+# openai_base_url: http://localhost:8000/v1
+# llm: llama-2-7b-chat
+
+# Training configuration
+llm_interval: 10
+hop: 3
+node_limit: 50
+
+# W&B configuration
+wandb_project: "GNN-Domain-Adaptation"
+wandb_entity: your-username-here

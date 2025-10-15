@@ -449,14 +449,23 @@ def train_epoch(epoch, encoder_name, encoder, optimizer):
 
                     expert_selections_cache[cache_key] = parsed_response
 
+                    # Debug: Print the parsed response to see what we got
+                    print(f"[DEBUG] Node {node_id} parsed response: {parsed_response}")
+
                     # Extract DPO preferences
                     if 'ranking' in parsed_response:
                         dpo_prefs = response_parser.parse_dpo_preferences(json_output_str, config.expert_num)
                         dpo_preferences.extend(dpo_prefs)
+                        print(f"[DEBUG] Node {node_id} extracted {len(dpo_prefs)} DPO preferences")
+                    else:
+                        print(f"[DEBUG] Node {node_id} no 'ranking' field in parsed response: {list(parsed_response.keys())}")
 
                     # Extract consistency rankings
                     if 'ranking' in parsed_response:
                         consistency_rankings[node_id] = parsed_response['ranking']
+                        print(f"[DEBUG] Node {node_id} consistency ranking: {parsed_response['ranking']}")
+                    else:
+                        print(f"[DEBUG] Node {node_id} no 'ranking' for consistency")
 
                 except Exception as e:
                     print(f"Node {node_id}: Error processing LLM response: {e}")
@@ -667,6 +676,7 @@ if analyzer:
             report = analyzer.generate_comprehensive_report()
 
 # Save training history
+os.makedirs("log", exist_ok=True)
 with open("log/training_history.json", 'w') as f:
     json.dump(training_history, f, indent=2, default=str)
 

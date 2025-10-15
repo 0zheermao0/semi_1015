@@ -538,7 +538,7 @@ def train_epoch(epoch, encoder_name, encoder, optimizer):
     torch.nn.utils.clip_grad_norm_(list(encoder.parameters()) + list(cls_model.parameters()), 1.0)
     optimizer.step()
 
-    # Log losses
+    # Log losses and performance metrics
     loss_dict = {
         'cls_loss': cls_loss.item(),
         'dpo_loss': dpo_loss.item(),
@@ -547,7 +547,8 @@ def train_epoch(epoch, encoder_name, encoder, optimizer):
         'gate_entropy_loss': gate_entropy_loss.item(),
         'aux_loss': aux_loss.item(),
         'total_loss': total_loss.item(),
-        'uncertain_nodes': len(uncertainty_node_indices)
+        'uncertain_nodes': len(uncertainty_node_indices),
+        'epoch': epoch
     }
 
     # Add weight information
@@ -555,10 +556,19 @@ def train_epoch(epoch, encoder_name, encoder, optimizer):
 
     wandb.log({f'{encoder_name}/train/{k}': v for k, v in loss_dict.items()}, step=epoch)
 
-    print(f"Epoch {epoch} [{encoder_name}] "
-          f"Cls: {cls_loss.item():.4f}, DPO: {dpo_loss.item():.4f}, "
-          f"Cons: {consistency_loss.item():.4f}, Div: {diversity_loss.item():.4f}, "
-          f"Total: {total_loss.item():.4f}")
+    # Track loss evolution for performance analysis
+    performance_metrics['loss_evolution'][encoder_name]['cls'].append(cls_loss.item())
+    performance_metrics['loss_evolution'][encoder_name]['dpo'].append(dpo_loss.item())
+    performance_metrics['loss_evolution'][encoder_name]['consistency'].append(consistency_loss.item())
+    performance_metrics['loss_evolution'][encoder_name]['diversity'].append(diversity_loss.item())
+    performance_metrics['loss_evolution'][encoder_name]['total'].append(total_loss.item())
+
+    # Enhanced training output with performance indicators
+    print(f"Epoch {epoch:3d} [{encoder_name:12s}] "
+          f"Cls: {cls_loss.item():6.4f} | DPO: {dpo_loss.item():6.4f} | "
+          f"Cons: {consistency_loss.item():6.4f} | Div: {diversity_loss.item():6.4f} | "
+          f"Gate: {gate_entropy_loss.item():6.4f} | Total: {total_loss.item():6.4f} | "
+          f"Uncertain: {len(uncertainty_node_indices):3d}")
 
     return total_loss.item(), loss_dict
 
@@ -574,9 +584,21 @@ for encoder_name, encoder in encoders.items():
         weight_decay=config.weight_decay
     )
 
-# Training statistics
-best_metrics = {encoder_name: {'target_acc': 0.0, 'epoch': 0} for encoder_name in encoders.keys()}
+# Training statistics and performance tracking
+best_metrics = {encoder_name: {'target_acc': 0.0, 'epoch': 0, 'source_acc': 0.0, 'macro_f1': 0.0, 'micro_f1': 0.0} for encoder_name in encoders.keys()}
 training_history = {encoder_name: [] for encoder_name in encoders.keys()}
+performance_metrics = {
+    'loss_evolution': {encoder_name: {'cls': [], 'dpo': [], 'consistency': [], 'diversity': [], 'total': []} for encoder_name in encoders.keys()},
+    'accuracy_evolution': {encoder_name: {'source': [], 'target': []} for encoder_name in encoders.keys()},
+    'convergence_metrics': {encoder_name: {'improvement_rate': [], 'stability_score': 0.0} for encoder_name in encoders.keys()}
+}
+
+# Early stopping and learning rate scheduling
+early_stopping_patience = 50
+early_stopping_counter = {encoder_name: 0 for encoder_name in encoders.keys()}
+best_validation_score = {encoder_name: 0.0 for encoder_name in encoders.keys()}
+lr_patience = 10
+lr_counter = {encoder_name: 0 for encoder_name in encoders.keys()}
 
 for epoch in range(1, config.epochs + 1):
     print(f"\n--- Epoch {epoch}/{config.epochs} ---")
@@ -589,81 +611,230 @@ for epoch in range(1, config.epochs + 1):
         epoch_results[encoder_name] = loss_dict
         training_history[encoder_name].append(loss_dict)
 
-    # Evaluation
+    # Evaluation with comprehensive performance analysis
     if epoch % 10 == 0 or epoch == config.epochs:
-        print("\n--- Evaluation ---")
+        print("\n" + "="*80)
+        print(f"EVALUATION AT EPOCH {epoch}")
+        print("="*80)
 
         for encoder_name, encoder in encoders.items():
             encoder.eval()
             cls_model.eval()
 
             with torch.no_grad():
-                source_correct, _, _, _, _, _ = test(source_data, f"{config.source}_{encoder_name}", encoder, cls_model, source_data.test_mask)
-                target_correct, macro_f1, micro_f1, embeddings, expert_outputs, clean_logits = test(target_data, f"{config.target}_{encoder_name}", encoder, cls_model)
+                # Source domain evaluation
+                source_correct, source_macro_f1, source_micro_f1, _, _, _ = test(
+                    source_data, f"{config.source}_{encoder_name}", encoder, cls_model, source_data.test_mask
+                )
 
-                print(f"[{encoder_name}] Source Acc: {source_correct:.4f}, Target Acc: {target_correct:.4f}, "
-                      f"Macro F1: {macro_f1:.4f}, Micro F1: {micro_f1:.4f}")
+                # Target domain evaluation
+                target_correct, target_macro_f1, target_micro_f1, embeddings, expert_outputs, clean_logits = test(
+                    target_data, f"{config.target}_{encoder_name}", encoder, cls_model
+                )
 
-                wandb.log({
-                    f'{encoder_name}/eval/source_acc': source_correct.item(),
-                    f'{encoder_name}/eval/target_acc': target_correct.item(),
-                    f'{encoder_name}/eval/macro_f1': macro_f1.item(),
-                    f'{encoder_name}/eval/micro_f1': micro_f1.item()
-                }, step=epoch)
+                # Track accuracy evolution
+                performance_metrics['accuracy_evolution'][encoder_name]['source'].append(source_correct.item())
+                performance_metrics['accuracy_evolution'][encoder_name]['target'].append(target_correct.item())
 
-                # Update best metrics
-                if target_correct > best_metrics[encoder_name]['target_acc']:
+                # Calculate convergence metrics
+                if len(performance_metrics['accuracy_evolution'][encoder_name]['target']) > 1:
+                    recent_improvement = (performance_metrics['accuracy_evolution'][encoder_name]['target'][-1] -
+                                          performance_metrics['accuracy_evolution'][encoder_name]['target'][-2])
+                    performance_metrics['convergence_metrics'][encoder_name]['improvement_rate'].append(recent_improvement)
+
+                # Comprehensive evaluation output
+                print(f"\n🔍 {encoder_name.upper()} ARCHITECTURE PERFORMANCE:")
+                print(f"   Source Domain  - Acc: {source_correct.item():6.4f} | Macro F1: {source_macro_f1.item():6.4f} | Micro F1: {source_micro_f1.item():6.4f}")
+                print(f"   Target Domain  - Acc: {target_correct.item():6.4f} | Macro F1: {target_macro_f1.item():6.4f} | Micro F1: {target_micro_f1.item():6.4f}")
+
+                # Domain adaptation metrics
+                domain_gap = abs(source_correct.item() - target_correct.item())
+                adaptation_ratio = target_correct.item() / (source_correct.item() + 1e-8)
+                print(f"   Domain Gap: {domain_gap:6.4f} | Adaptation Ratio: {adaptation_ratio:6.4f}")
+
+                # Update best metrics with comprehensive tracking
+                current_score = target_correct.item() + 0.1 * target_macro_f1.item() + 0.1 * target_micro_f1.item()
+                if current_score > best_validation_score[encoder_name]:
+                    best_validation_score[encoder_name] = current_score
                     best_metrics[encoder_name] = {
                         'target_acc': target_correct.item(),
                         'source_acc': source_correct.item(),
-                        'epoch': epoch,
-                        'macro_f1': macro_f1.item(),
-                        'micro_f1': micro_f1.item()
+                        'target_macro_f1': target_macro_f1.item(),
+                        'target_micro_f1': target_micro_f1.item(),
+                        'domain_gap': domain_gap,
+                        'adaptation_ratio': adaptation_ratio,
+                        'epoch': epoch
                     }
-                    print(f"*** New best target accuracy for {encoder_name}: {target_correct:.4f} at epoch {epoch} ***")
+                    print(f"   🏆 NEW BEST PERFORMANCE! Combined Score: {current_score:.4f}")
 
-                # Expert analysis
+                    # Early stopping counter reset
+                    early_stopping_counter[encoder_name] = 0
+                    lr_counter[encoder_name] = 0
+                else:
+                    early_stopping_counter[encoder_name] += 1
+                    lr_counter[encoder_name] += 1
+
+                # Log to W&B with enhanced metrics
+                wandb.log({
+                    f'{encoder_name}/eval/source_acc': source_correct.item(),
+                    f'{encoder_name}/eval/target_acc': target_correct.item(),
+                    f'{encoder_name}/eval/source_macro_f1': source_macro_f1.item(),
+                    f'{encoder_name}/eval/target_macro_f1': target_macro_f1.item(),
+                    f'{encoder_name}/eval/source_micro_f1': source_micro_f1.item(),
+                    f'{encoder_name}/eval/target_micro_f1': target_micro_f1.item(),
+                    f'{encoder_name}/eval/domain_gap': domain_gap,
+                    f'{encoder_name}/eval/adaptation_ratio': adaptation_ratio,
+                    f'{encoder_name}/eval/best_score': current_score
+                }, step=epoch)
+
+                # Expert analysis for model interpretability
                 if config.analyze_experts and analyzer and epoch % 50 == 0:
-                    expert_indices, expert_probs, _ = encoder.get_node_expert_assignment(
-                        target_data.x, target_data.edge_index
-                    )
+                    try:
+                        expert_indices, expert_probs, _ = encoder.get_node_expert_assignment(
+                            target_data.x, target_data.edge_index
+                        )
 
-                    # Convert to torch tensors if needed
-                    if not isinstance(expert_indices, torch.Tensor):
-                        expert_indices = torch.tensor(expert_indices)
-                    if not isinstance(expert_probs, torch.Tensor):
-                        expert_probs = torch.tensor(expert_probs)
+                        # Convert to torch tensors if needed
+                        if not isinstance(expert_indices, torch.Tensor):
+                            expert_indices = torch.tensor(expert_indices)
+                        if not isinstance(expert_probs, torch.Tensor):
+                            expert_probs = torch.tensor(expert_probs)
 
-                    usage_results = analyzer.analyze_expert_usage(
-                        expert_indices, expert_probs, target_data.y, config.expert_num
-                    )
-                    diversity_results = analyzer.analyze_expert_diversity(expert_outputs, clean_logits)
+                        usage_results = analyzer.analyze_expert_usage(
+                            expert_indices, expert_probs, target_data.y, config.expert_num
+                        )
+                        diversity_results = analyzer.analyze_expert_diversity(expert_outputs, clean_logits)
 
-                    wandb.log({
-                        f'{encoder_name}/expert/load_balance': usage_results['load_balance_score'],
-                        f'{encoder_name}/expert/diversity_score': diversity_results['diversity_score'],
-                        f'{encoder_name}/expert/usage_entropy': usage_results['usage_entropy']
-                    }, step=epoch)
+                        print(f"   🧠 Expert Analysis - Load Balance: {usage_results['load_balance_score']:.4f} | "
+                              f"Diversity: {diversity_results['diversity_score']:.4f} | "
+                              f"Usage Entropy: {usage_results['usage_entropy']:.4f}")
 
-                # Embedding visualization
+                        wandb.log({
+                            f'{encoder_name}/expert/load_balance': usage_results['load_balance_score'],
+                            f'{encoder_name}/expert/diversity_score': diversity_results['diversity_score'],
+                            f'{encoder_name}/expert/usage_entropy': usage_results['usage_entropy']
+                        }, step=epoch)
+                    except Exception as e:
+                        print(f"   ⚠️  Expert analysis failed: {e}")
+
+                # Embedding visualization for convergence monitoring
                 if config.visualize_embeddings and visualizer and epoch % 50 == 0:
-                    visualizer.visualize_embeddings_tsne(
-                        embeddings, target_data.y,
-                        title=f"{encoder_name} t-SNE Epoch {epoch}"
-                    )
+                    try:
+                        visualizer.visualize_embeddings_tsne(
+                            embeddings, target_data.y,
+                            title=f"{encoder_name} t-SNE Epoch {epoch}"
+                        )
+                        print(f"   📊 Embedding visualization saved for epoch {epoch}")
+                    except Exception as e:
+                        print(f"   ⚠️  Embedding visualization failed: {e}")
 
-# Final results
-print("\n" + "=" * 80)
-print("FINAL RESULTS")
-print("=" * 80)
+                # Learning rate scheduling for convergence optimization
+                if lr_counter[encoder_name] >= lr_patience:
+                    for param_group in optimizers[encoder_name].param_groups:
+                        param_group['lr'] *= 0.5
+                    print(f"   📉 Learning rate reduced to {optimizers[encoder_name].param_groups[0]['lr']:.6f} for {encoder_name}")
+                    lr_counter[encoder_name] = 0
+
+                # Early stopping check
+                if early_stopping_counter[encoder_name] >= early_stopping_patience:
+                    print(f"\n⏹️  Early stopping triggered for {encoder_name} at epoch {epoch}")
+                    print(f"   No improvement for {early_stopping_patience} consecutive evaluations")
+                    break
+
+# Final comprehensive results and analysis
+print("\n" + "=" * 100)
+print("🏆 FINAL TRAINING RESULTS AND PERFORMANCE ANALYSIS")
+print("=" * 100)
+
+print(f"\n📊 TRAINING CONFIGURATION:")
+print(f"   Source Domain: {config.source} → Target Domain: {config.target}")
+print(f"   MoE Architecture: {config.moe_architecture}")
+print(f"   Expert Count: {config.expert_num} | LLM Interval: {config.llm_interval}")
+print(f"   Total Epochs: {config.epochs} | Early Stopping Patience: {early_stopping_patience}")
+
+# Results summary table
+print(f"\n📈 PERFORMANCE SUMMARY:")
+print("-" * 100)
+print(f"{'Architecture':<15} {'Best Epoch':<10} {'Source Acc':<12} {'Target Acc':<12} {'Macro F1':<10} {'Micro F1':<10} {'Domain Gap':<12} {'Adaptation':<12}")
+print("-" * 100)
 
 for encoder_name, metrics in best_metrics.items():
-    print(f"\n{encoder_name.upper()} ARCHITECTURE:")
-    print(f"  Best Epoch: {metrics['epoch']}")
-    print(f"  Best Target Accuracy: {metrics['target_acc']:.5f}")
-    print(f"  Corresponding Source Accuracy: {metrics['source_acc']:.5f}")
-    print(f"  Macro F1: {metrics['macro_f1']:.5f}")
-    print(f"  Micro F1: {metrics['micro_f1']:.5f}")
+    print(f"{encoder_name.upper():<15} {metrics['epoch']:<10} {metrics['source_acc']:<12.4f} {metrics['target_acc']:<12.4f} "
+          f"{metrics.get('target_macro_f1', 0.0):<10.4f} {metrics.get('target_micro_f1', 0.0):<10.4f} "
+          f"{metrics.get('domain_gap', 0.0):<12.4f} {metrics.get('adaptation_ratio', 0.0):<12.4f}")
+
+print("-" * 100)
+
+# Convergence analysis
+print(f"\n📈 CONVERGENCE ANALYSIS:")
+for encoder_name in encoders.keys():
+    if encoder_name in performance_metrics['convergence_metrics']:
+        improvement_rates = performance_metrics['convergence_metrics'][encoder_name]['improvement_rate']
+        if improvement_rates:
+            avg_improvement = np.mean(improvement_rates)
+            stability_score = 1.0 - np.std(improvement_rates) if len(improvement_rates) > 1 else 1.0
+            print(f"   {encoder_name.upper()}: Avg Improvement: {avg_improvement:+.4f} | Stability: {stability_score:.4f}")
+
+# Loss evolution summary
+print(f"\n📉 LOSS EVOLUTION SUMMARY:")
+for encoder_name in encoders.keys():
+    if encoder_name in performance_metrics['loss_evolution']:
+        evolution = performance_metrics['loss_evolution'][encoder_name]
+        print(f"\n   {encoder_name.upper()} Loss Trends:")
+        print(f"      Classification: {evolution['cls'][0]:.4f} → {evolution['cls'][-1]:.4f} "
+              f"(Δ: {evolution['cls'][-1] - evolution['cls'][0]:+.4f})")
+        print(f"      DPO:          {evolution['dpo'][0]:.4f} → {evolution['dpo'][-1]:.4f} "
+              f"(Δ: {evolution['dpo'][-1] - evolution['dpo'][0]:+.4f})")
+        print(f"      Consistency:  {evolution['consistency'][0]:.4f} → {evolution['consistency'][-1]:.4f} "
+              f"(Δ: {evolution['consistency'][-1] - evolution['consistency'][0]:+.4f})")
+        print(f"      Diversity:    {evolution['diversity'][0]:.4f} → {evolution['diversity'][-1]:.4f} "
+              f"(Δ: {evolution['diversity'][-1] - evolution['diversity'][0]:+.4f})")
+        print(f"      Total:       {evolution['total'][0]:.4f} → {evolution['total'][-1]:.4f} "
+              f"(Δ: {evolution['total'][-1] - evolution['total'][0]:+.4f})")
+
+# Performance comparison with baseline
+print(f"\n🎯 PERFORMANCE COMPARISON:")
+for encoder_name, metrics in best_metrics.items():
+    domain_gap = metrics.get('domain_gap', 0.0)
+    adaptation_ratio = metrics.get('adaptation_ratio', 0.0)
+
+    if domain_gap < 0.1:
+        gap_status = "✅ Excellent"
+    elif domain_gap < 0.2:
+        gap_status = "🟡 Good"
+    else:
+        gap_status = "⚠️ Needs Improvement"
+
+    if adaptation_ratio > 0.9:
+        adapt_status = "✅ Excellent"
+    elif adaptation_ratio > 0.8:
+        adapt_status = "🟡 Good"
+    else:
+        adapt_status = "⚠️ Needs Improvement"
+
+    print(f"   {encoder_name.upper()}: Domain Gap {gap_status} | Adaptation {adapt_status}")
+
+print(f"\n🔧 TRAINING EFFICIENCY:")
+for encoder_name, epochs_trained in [(name, len(history)) for name, history in training_history.items()]:
+    efficiency = epochs_trained / config.epochs * 100
+    print(f"   {encoder_name.upper()}: {epochs_trained}/{config.epochs} epochs ({efficiency:.1f}% of planned)")
+
+# Recommendations based on results
+print(f"\n💡 TRAINING RECOMMENDATIONS:")
+best_encoder = max(best_metrics.items(), key=lambda x: x[1].get('target_acc', 0))
+print(f"   Best Performing Architecture: {best_encoder[0].upper()}")
+print(f"   Target Achievement: {best_encoder[1]['target_acc']:.4f}")
+
+if best_encoder[1].get('domain_gap', 0.0) > 0.15:
+    print("   ⚠️  Consider: Increased domain alignment techniques")
+if best_encoder[1].get('adaptation_ratio', 0.0) < 0.8:
+    print("   ⚠️  Consider: Enhanced transfer learning strategies")
+
+print(f"\n🚀 MODEL SAVED FOR DEPLOYMENT:")
+model_save_dir = "models"
+for encoder_name in encoders.keys():
+    print(f"   {encoder_name.upper()}: {model_save_dir}/{config.source}-{config.target}-{encoder_name}-encoder.pt")
+print(f"   CLASSIFIER: {model_save_dir}/{config.source}-{config.target}-classifier.pt")
 
 # Save final models and analysis
 for encoder_name, encoder in encoders.items():
@@ -693,10 +864,38 @@ if analyzer:
             analyzer.analyze_expert_diversity(expert_outputs, clean_logits)
             report = analyzer.generate_comprehensive_report()
 
-# Save training history
+# Save comprehensive training data
 os.makedirs("log", exist_ok=True)
+
+# Save basic training history
 with open("log/training_history.json", 'w') as f:
     json.dump(training_history, f, indent=2, default=str)
+
+# Save detailed performance metrics
+performance_data = {
+    'best_metrics': best_metrics,
+    'performance_metrics': performance_metrics,
+    'training_config': {
+        'source': config.source,
+        'target': config.target,
+        'moe_architecture': config.moe_architecture,
+        'expert_num': config.expert_num,
+        'epochs': config.epochs,
+        'learning_rate': config.learning_rate,
+        'batch_size': config.batch_size,
+        'llm_interval': config.llm_interval,
+        'uncertainty_k': config.uncertainty_k,
+        'early_stopping_patience': early_stopping_patience,
+        'seed': config.seed
+    }
+}
+
+with open("log/performance_analysis.json", 'w') as f:
+    json.dump(performance_data, f, indent=2, default=str)
+
+print(f"\n💾 Training data saved to log/ directory")
+print(f"   📄 training_history.json: Basic loss and accuracy history")
+print(f"   📄 performance_analysis.json: Comprehensive performance analysis and metrics")
 
 wandb.finish()
 print("\nTraining completed successfully!")
